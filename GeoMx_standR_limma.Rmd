@@ -1,0 +1,199 @@
+---
+title: "GeoMx_standR_limma"
+author: "AEKS"
+date: "2026-05-12"
+output: html_document
+---
+
+```{r setup packages}
+library(tidyverse)
+library(readxl)
+library(standR)
+library(SpatialExperiment)
+library(ggplot2)
+library(ggalluvial)
+library(edgeR)
+library(scater)
+library(biomaRt)
+library(ComplexHeatmap)
+library(circlize)
+library(openxlsx)
+library(Cairo)
+library(DESeq2)
+library(tidyverse)
+library(fgsea)
+library(qusage)
+library(enrichR)
+library(EnhancedVolcano)
+library(svglite)
+library(aPEAR)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(scales)
+```
+
+
+```{r read}
+set.seed(123)
+
+#Open ProbeQC and convert to SPE object
+countFile <- read_excel("Probe_QC.xlsx", sheet = 3)
+countFile <- as.data.frame(countFile)
+sampleAnnoFile <- read_excel("Probe_QC.xlsx", sheet = 1)
+sampleAnnoFile <- as.data.frame(sampleAnnoFile)
+featureAnnoFile <- read_excel("Probe_QC.xlsx", sheet = 2)
+featureAnnoFile <- as.data.frame(featureAnnoFile)
+
+#featureAnnoFile <- read.table("featureAnnoFile.tsv", header = TRUE)
+spe <- readGeoMx(countFile, sampleAnnoFile, featureAnnoFile)
+
+```
+
+```{r QC checks}
+#sampleLevelQC
+plotSampleInfo(spe, column2plot = c("SlideName", "ROIType"))
+
+#geneLevelQC
+spe <- addPerROIQC(spe, rm_genes = TRUE)
+plotGeneQC(spe, ordannots = "SlideName", point_size = 2, top_n = 9)
+
+#ROILevelQC
+plotROIQC(spe, x_threshold = 150, color = ROIType)
+
+
+#RLE and PCA plots
+plotROIQC(spe,  x_axis = "AOISurfaceArea", x_lab = "AreaSize", y_axis = "lib_size", y_lab = "Library size", col = ROIType)
+rleplot <- plotRLExpr(spe, ordannots = "ROIType", color = ROIType)  #assay 2 to run on logCPM 
+ ggsave("rleplot1.svg", plot = rleplot, height = 6, width = 8, path = pathout)
+
+drawPCA(spe, assay = 2, color = Patient_ID)
+ ggsave("pacplot1.svg", plot = pcaplot, height = 4, width = 5, path = pathout)
+
+drawPCA(spe, assay = 2, color = ROIType)
+ ggsave("pacplot2.svg", plot = pcaplot, height = 4, width = 6, path = pathout)
+ 
+ 
+ #normalization
+#spe <- geomxNorm(spe, method = "CPM")
+rleplot <- plotRLExpr(spe, ordannots = "ROIType", assay = 2, color = ROIType) + ggtitle("CPM")
+ ggsave("rleplot2.svg", plot = rleplot, height = 6, width = 8, path = pathout)
+```
+
+
+```{r DGE C-M}
+#Run limma DGE with EdgeR filtering
+
+dge <- SE2DGEList(spe)
+design <- model.matrix(~0 + ROIType, data = colData(spe))
+
+colnames(design)
+
+#Replace contrast for different comparisons
+contr.matrix <- makeContrasts(
+   BvT = ROITypeDisease_Muscle - ROITypeControl_Muscle,
+   levels = colnames(design))
+
+
+keep <- filterByExpr(dge, design)
+table(keep)
+rownames(dge)[!keep]
+dge_all <- dge[keep, ]
+
+#bcv
+dge_all <- estimateDisp(dge_all, design = design, robust = TRUE)
+
+
+plotBCV(dge_all, legend.position = "topleft", ylim = c(0, 1.3))
+bcv_df <- data.frame(
+  'BCV' = sqrt(dge_all$tagwise.dispersion),
+  'AveLogCPM' = dge_all$AveLogCPM,
+  'gene_id' = rownames(dge_all)
+)
+
+highbcv <- bcv_df$BCV > 0.8
+highbcv_df <- bcv_df[highbcv, ]
+points(highbcv_df$AveLogCPM, highbcv_df$BCV, col = "red")
+text(highbcv_df$AveLogCPM, highbcv_df$BCV, labels = highbcv_df$gene_id, pos = 4)
+
+#Deduplicate correalation
+v_tmp <- voom(dge_all, design, plot = TRUE) 
+
+dupcor <- duplicateCorrelation(v_tmp, design, block=spe$Tissue2)
+v = voom(dge_all, design, plot=TRUE,  block=spe$Tissue2, correlation =dupcor$consensus)
+dupcor <- duplicateCorrelation(v, design, block=spe$Tissue2)
+
+
+fit <- lmFit(v, design, block=spe$Tissue2, correlation=dupcor$consensus)
+
+fit_contrast <- contrasts.fit(fit, contrasts = contr.matrix)
+
+efit <- eBayes(fit_contrast, robust = TRUE)
+
+results_efit<- decideTests(efit, p.value = 0.05)
+summary_efit <- summary(results_efit)
+
+summary_efit
+
+
+de_resultsC_M <- topTable(efit, coef = "BvT", n = Inf)
+
+```
+
+```{r extract normalized count tables CPM/TPM}
+#CPM
+countFile_cpm <- countFile
+rownames(countFile_cpm) <- countFile_cpm$TargetName
+countFile_cpm <- countFile_cpm[, -1]
+countFile_cpm <- edgeR::cpm(countFile_cpm)
+
+
+#Alternative: TPM method with gene lengtη
+gene_counts <- dge$counts
+gene_counts <- as.data.frame(gene_counts)
+
+mart <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+gene_ids <- rownames(gene_counts)  # Replace this with your actual gene IDs
+
+gene_data <- getBM(attributes = c('hgnc_symbol', 'transcript_length'),
+               filters = 'hgnc_symbol',
+                   values = gene_ids,
+                   mart = mart)
+
+# Calculate average transcript length per gene
+gene_lengths <- aggregate(transcript_length ~ hgnc_symbol, data = gene_data, FUN = mean)
+
+# Match the order of gene lengths with the order of genes in your counts matrix
+matched_lengths <- gene_lengths$transcript_length[match(gene_ids, gene_lengths$hgnc_symbol)]
+
+
+# Handle NAs in matched_lengths
+if (any(is.na(matched_lengths))) {
+  warning("Some gene lengths are missing. Consider removing or imputing these genes.")
+  #  Remove genes with missing lengths
+  keep <- !is.na(matched_lengths)
+  counts <- gene_counts[keep, ]
+  matched_lengths <- matched_lengths[keep]
+  gene_ids <- gene_ids[keep]
+}
+
+# Convert lengths from base pairs to kilobases
+matched_lengths_kb <- matched_lengths / 1000
+
+# Calculate RPK (Reads Per Kilobase)
+RPK <- sweep(counts, 1, matched_lengths_kb, FUN = "/")
+
+#  Calculate the per-million scaling factor
+RPK_sum <- colSums(RPK)
+scaling_factors <- RPK_sum / 1e6
+
+# Calculate TPM (Transcripts Per Million)
+gene_table_tpm <- sweep(RPK, 2, scaling_factors, FUN = "/")
+
+
+
+
+```
+
+
+
